@@ -1,0 +1,104 @@
+name: build-win-sm120
+
+# 为 RTX 50 系 (Blackwell, sm_120) 编译 Windows x64 版
+# 上游 tqp-v0.4.0 的官方 Windows 包用 CUDA 12.4，最高只到 .target sm_90 的 PTX，
+# 在 sm_120 上只能靠 PTX JIT，性能和兼容性都不是最优，所以这里用 CUDA 13.1 直接编 sm_120。
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda:
+        description: 'CUDA toolkit version'
+        required: true
+        default: '13.1'
+        type: choice
+        options:
+          - '13.1'
+          - '13.3'
+      arch:
+        description: 'CMAKE_CUDA_ARCHITECTURES (120=Blackwell, 86=Ampere, 89=Ada)'
+        required: true
+        default: '120'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: tqp-v0.4.0
+          fetch-depth: 1
+
+      - name: Show source commit
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          git describe --tags --always
+
+      - name: Setup CUDA
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ inputs.cuda }}
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      - name: Configure
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=${{ inputs.arch }}
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          $dst = "dist"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item "build\bin\Release\*" $dst -Recurse -Force
+          Copy-Item LICENSE $dst -Force -ErrorAction SilentlyContinue
+
+          $cuda = $env:CUDA_PATH
+          Write-Host "CUDA_PATH=$cuda"
+          foreach ($n in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            foreach ($sub in @("bin", "bin\x64", "lib", "lib\x64")) {
+              $p = Join-Path $cuda $sub
+              if (Test-Path $p) {
+                Get-ChildItem -Path $p -Filter $n -ErrorAction SilentlyContinue |
+                  Copy-Item -Destination $dst -Force
+              }
+            }
+          }
+
+          Get-ChildItem $dst | Measure-Object -Property Length -Sum |
+            ForEach-Object { "PACKED: $($_.Count) files, $([math]::Round($_.Sum/1MB,1)) MB" }
+
+          if (-not (Test-Path "$dst\llama-server.exe")) {
+            Write-Error "llama-server.exe missing"
+            exit 1
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: turboquant-win-x64-cuda${{ inputs.cuda }}-sm${{ inputs.arch }}
+          path: dist/*
+          compression-level: 1
+          retention-days: 14
